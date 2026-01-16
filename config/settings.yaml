@@ -1,0 +1,38 @@
+# entra-docker-sync configuration
+
+entra:
+  tenant_id: "${ENTRA_TENANT_ID}"
+  client_id: "${ENTRA_CLIENT_ID}"
+  client_secret: "${ENTRA_CLIENT_SECRET}"
+  graph_api_base_url: "https://graph.microsoft.com/v1.0"
+  poll_interval_seconds: 300
+
+docker:
+  host: "unix:///var/run/docker.sock"
+  default_network: "bridge"
+  container_label_prefix: "entra-sync"
+  restart_policy: "unless-stopped"
+
+terraform:
+  state_dir: "/var/lib/entra-docker-sync/tfstate"
+  workspace_prefix: "entra_group"
+
+logging:
+  level: "INFO"
+  log_file: "/var/log/entra-docker-sync/sync.log"
+  report_dir: "/var/log/entra-docker-sync/reports"
+  max_report_age_days: 30
+
+group_mappings: []
+# Example group_mappings entry:
+# - group_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+#   group_name: "docker-nginx-users"
+#   container:
+#     image: "nginx:latest"
+#     name_prefix: "nginx"
+#     ports:
+#       - "8080:80"
+#     environment:
+#       NGINX_HOST: "localhost"
+#     volumes:
+#       - "/data/nginx:/usr/share/nginx/html:ro"
