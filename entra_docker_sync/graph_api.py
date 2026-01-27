@@ -1,141 +1,123 @@
-"""Microsoft Graph API client for polling Entra ID group memberships."""
-
+import requests
 import logging
 import time
-from typing import Any
-
-import requests
-
-from .auth import get_access_token
+from entra_docker_sync.auth import get_access_token
 
 logger = logging.getLogger(__name__)
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
+MAX_RETRIES = 3
+RETRY_BACKOFF = 2  # seconds
+
+_token_cache = {
+    "token": None,
+    "expires_at": 0
+}
 
 
-def get_group_members(group_id: str, token: str) -> list[dict[str, Any]]:
-    """Fetch all members of an Entra ID group via Microsoft Graph API.
+def _get_valid_token(config):
+    """Return a cached token or fetch a new one if expired."""
+    now = time.time()
+    if _token_cache["token"] is None or now >= _token_cache["expires_at"]:
+        logger.debug("Access token missing or expired, fetching a new one.")
+        token_data = get_access_token(config)
+        _token_cache["token"] = token_data["access_token"]
+        # Default to 55 minutes if expires_in not provided
+        expires_in = token_data.get("expires_in", 3300)
+        _token_cache["expires_at"] = now + int(expires_in) - 60  # 1-minute buffer
+    return _token_cache["token"]
 
-    Args:
-        group_id: The object ID of the Entra ID group.
-        token: A valid Bearer token for the Graph API.
 
-    Returns:
-        A list of member objects returned by the Graph API.
+def _make_request(method, url, config, **kwargs):
+    """Make an authenticated HTTP request with retry logic."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        token = _get_valid_token(config)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        try:
+            response = requests.request(method, url, headers=headers, timeout=10, **kwargs)
 
-    Raises:
-        requests.HTTPError: If the Graph API returns a non-2xx response.
+            if response.status_code == 401:
+                logger.warning("Received 401 Unauthorized. Invalidating token cache and retrying.")
+                _token_cache["token"] = None
+                _token_cache["expires_at"] = 0
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_BACKOFF * attempt)
+                    continue
+
+            if response.status_code == 429:
+                retry_after = int(response.headers.get("Retry-After", RETRY_BACKOFF * attempt))
+                logger.warning(f"Rate limited by Graph API. Retrying after {retry_after}s (attempt {attempt}/{MAX_RETRIES}).")
+                time.sleep(retry_after)
+                continue
+
+            response.raise_for_status()
+            return response
+
+        except requests.exceptions.Timeout:
+            logger.error(f"Request timed out on attempt {attempt}/{MAX_RETRIES}: {url}")
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF * attempt)
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"Connection error on attempt {attempt}/{MAX_RETRIES}: {e}")
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF * attempt)
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error: {e}")
+            raise
+
+    raise RuntimeError(f"Failed to complete request after {MAX_RETRIES} attempts: {url}")
+
+
+def get_group_members(group_id, config):
+    """
+    Fetch all members of an Entra ID group by group_id.
+    Handles pagination via @odata.nextLink.
+
+    Returns a list of member dicts with keys: id, displayName, userPrincipalName.
     """
     url = f"{GRAPH_BASE_URL}/groups/{group_id}/members"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-    members: list[dict[str, Any]] = []
+    members = []
 
     while url:
-        response = requests.get(url, headers=headers, timeout=30)
-        response.raise_for_status()
+        response = _make_request("GET", url, config)
         data = response.json()
-        members.extend(data.get("value", []))
-        url = data.get("@odata.nextLink")  # handle pagination
 
-    logger.debug("Fetched %d members from group %s", len(members), group_id)
+        for member in data.get("value", []):
+            members.append({
+                "id": member.get("id"),
+                "displayName": member.get("displayName"),
+                "userPrincipalName": member.get("userPrincipalName"),
+            })
+
+        url = data.get("@odata.nextLink")
+        if url:
+            logger.debug(f"Fetching next page of members for group {group_id}.")
+
+    logger.info(f"Retrieved {len(members)} member(s) for group {group_id}.")
     return members
 
 
-def get_group_display_name(group_id: str, token: str) -> str:
-    """Retrieve the display name of an Entra ID group.
-
-    Args:
-        group_id: The object ID of the Entra ID group.
-        token: A valid Bearer token for the Graph API.
-
-    Returns:
-        The display name string of the group.
+def get_group_by_name(group_name, config):
     """
-    url = f"{GRAPH_BASE_URL}/groups/{group_id}?$select=displayName"
-    headers = {"Authorization": f"Bearer {token}"}
-    response = requests.get(url, headers=headers, timeout=30)
-    response.raise_for_status()
-    return response.json().get("displayName", group_id)
+    Look up an Entra ID group by display name.
 
-
-def poll_group_memberships(
-    group_ids: list[str],
-    poll_interval: int = 60,
-    max_retries: int = 3,
-) -> dict[str, list[dict[str, Any]]]:
-    """Poll multiple Entra ID groups and return their current memberships.
-
-    Fetches a fresh access token and queries each group in sequence.
-    Retries on transient failures up to max_retries times.
-
-    Args:
-        group_ids: List of Entra ID group object IDs to poll.
-        poll_interval: Seconds to wait between retry attempts.
-        max_retries: Maximum number of retry attempts per group.
-
-    Returns:
-        A dict mapping group_id -> list of member objects.
+    Returns the first matching group dict or None if not found.
     """
-    token = get_access_token()
-    memberships: dict[str, list[dict[str, Any]]] = {}
+    url = f"{GRAPH_BASE_URL}/groups"
+    params = {"$filter": f"displayName eq '{group_name}'", "$select": "id,displayName"}
 
-    for group_id in group_ids:
-        attempt = 0
-        while attempt < max_retries:
-            try:
-                display_name = get_group_display_name(group_id, token)
-                members = get_group_members(group_id, token)
-                memberships[group_id] = members
-                logger.info(
-                    "Group '%s' (%s): %d member(s) found.",
-                    display_name,
-                    group_id,
-                    len(members),
-                )
-                break
-            except requests.HTTPError as exc:
-                attempt += 1
-                logger.warning(
-                    "HTTP error polling group %s (attempt %d/%d): %s",
-                    group_id,
-                    attempt,
-                    max_retries,
-                    exc,
-                )
-                if attempt < max_retries:
-                    time.sleep(poll_interval)
-                else:
-                    logger.error(
-                        "Failed to fetch membership for group %s after %d attempts.",
-                        group_id,
-                        max_retries,
-                    )
-                    memberships[group_id] = []
+    response = _make_request("GET", url, config, params=params)
+    data = response.json()
+    groups = data.get("value", [])
 
-    return memberships
+    if not groups:
+        logger.warning(f"No group found with name '{group_name}'.")
+        return None
 
+    if len(groups) > 1:
+        logger.warning(f"Multiple groups found for name '{group_name}'. Using the first result.")
 
-def extract_user_principals(
-    members: list[dict[str, Any]],
-) -> list[str]:
-    """Extract userPrincipalName values from a list of Graph API member objects.
-
-    Only objects of type '#microsoft.graph.user' are included.
-
-    Args:
-        members: List of member dicts as returned by the Graph API.
-
-    Returns:
-        Sorted list of userPrincipalName strings.
-    """
-    principals: list[str] = []
-    for member in members:
-        odata_type = member.get("@odata.type", "")
-        if odata_type == "#microsoft.graph.user":
-            upn = member.get("userPrincipalName")
-            if upn:
-                principals.append(upn)
-    return sorted(principals)
+    return groups[0]
