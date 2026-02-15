@@ -1,114 +1,183 @@
-"""Docker container lifecycle management module."""
-
 import subprocess
 import logging
+import json
+import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 
-class DockerManager:
-    """Manages Docker container start/stop operations on the local host."""
+def run_docker_command(args: list, capture_output: bool = True) -> subprocess.CompletedProcess:
+    """Run a docker CLI command and return the result."""
+    cmd = ["docker"] + args
+    logger.debug("Running docker command: %s", " ".join(cmd))
+    result = subprocess.run(
+        cmd,
+        capture_output=capture_output,
+        text=True
+    )
+    if result.returncode != 0:
+        logger.error("Docker command failed: %s\nStderr: %s", " ".join(cmd), result.stderr)
+    return result
 
-    def __init__(self, docker_binary: str = "docker"):
-        self.docker_binary = docker_binary
-        self._verify_docker_available()
 
-    def _verify_docker_available(self) -> None:
-        """Ensure the Docker binary is accessible."""
-        try:
-            result = subprocess.run(
-                [self.docker_binary, "version", "--format", "{{.Server.Version}}"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if result.returncode != 0:
-                raise EnvironmentError(
-                    f"Docker daemon not reachable: {result.stderr.strip()}"
-                )
-            logger.debug("Docker version: %s", result.stdout.strip())
-        except FileNotFoundError:
-            raise EnvironmentError(
-                f"Docker binary not found at '{self.docker_binary}'. "
-                "Ensure Docker is installed and on PATH."
-            )
+def start_container(container_name: str, image: str, env_vars: dict = None, ports: dict = None) -> bool:
+    """Start a Docker container with the given configuration."""
+    args = ["run", "-d", "--name", container_name]
 
-    def start_container(self, container_name: str, image: str, env_vars: Optional[dict] = None) -> bool:
-        """Start a Docker container. Returns True on success."""
-        cmd = [self.docker_binary, "run", "-d", "--name", container_name]
-        if env_vars:
-            for key, value in env_vars.items():
-                cmd.extend(["-e", f"{key}={value}"])
-        cmd.append(image)
+    if env_vars:
+        for key, value in env_vars.items():
+            args += ["-e", f"{key}={value}"]
 
-        logger.info("Starting container '%s' from image '%s'", container_name, image)
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
+    if ports:
+        for host_port, container_port in ports.items():
+            args += ["-p", f"{host_port}:{container_port}"]
+
+    args.append(image)
+
+    result = run_docker_command(args)
+    if result.returncode == 0:
+        logger.info("Container '%s' started successfully.", container_name)
+        return True
+    else:
+        logger.error("Failed to start container '%s'.", container_name)
+        return False
+
+
+def stop_container(container_name: str, timeout: int = 10) -> bool:
+    """Stop a running Docker container gracefully."""
+    result = run_docker_command(["stop", "--time", str(timeout), container_name])
+    if result.returncode == 0:
+        logger.info("Container '%s' stopped successfully.", container_name)
+        return True
+    else:
+        logger.error("Failed to stop container '%s'.", container_name)
+        return False
+
+
+def remove_container(container_name: str, force: bool = False) -> bool:
+    """Remove a Docker container."""
+    args = ["rm"]
+    if force:
+        args.append("-f")
+    args.append(container_name)
+
+    result = run_docker_command(args)
+    if result.returncode == 0:
+        logger.info("Container '%s' removed successfully.", container_name)
+        return True
+    else:
+        logger.error("Failed to remove container '%s'.", container_name)
+        return False
+
+
+def get_container_status(container_name: str) -> Optional[str]:
+    """Get the current status of a Docker container."""
+    result = run_docker_command([
+        "inspect",
+        "--format", "{{.State.Status}}",
+        container_name
+    ])
+    if result.returncode == 0:
+        status = result.stdout.strip()
+        logger.debug("Container '%s' status: %s", container_name, status)
+        return status
+    return None
+
+
+def get_container_health(container_name: str) -> dict:
+    """Retrieve health check status and details for a Docker container."""
+    result = run_docker_command([
+        "inspect",
+        "--format",
+        "{{json .State.Health}}",
+        container_name
+    ])
+
+    if result.returncode != 0:
+        logger.warning("Could not retrieve health info for container '%s'.", container_name)
+        return {"status": "unknown", "failing_streak": 0, "log": []}
+
+    raw = result.stdout.strip()
+    if not raw or raw == "null":
+        logger.debug("Container '%s' has no health check configured.", container_name)
+        return {"status": "none", "failing_streak": 0, "log": []}
+
+    try:
+        health_data = json.loads(raw)
+        return {
+            "status": health_data.get("Status", "unknown"),
+            "failing_streak": health_data.get("FailingStreak", 0),
+            "log": [
+                {
+                    "start": entry.get("Start"),
+                    "end": entry.get("End"),
+                    "exit_code": entry.get("ExitCode"),
+                    "output": entry.get("Output", "").strip()
+                }
+                for entry in health_data.get("Log", [])
+            ]
+        }
+    except json.JSONDecodeError as exc:
+        logger.error("Failed to parse health JSON for container '%s': %s", container_name, exc)
+        return {"status": "parse_error", "failing_streak": 0, "log": []}
+
+
+def wait_for_healthy(container_name: str, timeout: int = 60, interval: int = 5) -> bool:
+    """Poll container health until healthy or timeout is reached."""
+    elapsed = 0
+    logger.info("Waiting for container '%s' to become healthy (timeout=%ds).", container_name, timeout)
+
+    while elapsed < timeout:
+        health = get_container_health(container_name)
+        status = health.get("status")
+
+        if status == "healthy":
+            logger.info("Container '%s' is healthy after %ds.", container_name, elapsed)
+            return True
+        elif status == "unhealthy":
+            failing_streak = health.get("failing_streak", 0)
+            last_log = health["log"][-1] if health["log"] else {}
             logger.error(
-                "Failed to start container '%s': %s", container_name, result.stderr.strip()
-            )
-            return False
-        logger.info("Container '%s' started (id=%s)", container_name, result.stdout.strip()[:12])
-        return True
-
-    def stop_container(self, container_name: str, remove: bool = True) -> bool:
-        """Stop (and optionally remove) a running Docker container."""
-        logger.info("Stopping container '%s'", container_name)
-        stop_result = subprocess.run(
-            [self.docker_binary, "stop", container_name],
-            capture_output=True,
-            text=True,
-        )
-        if stop_result.returncode != 0:
-            logger.warning(
-                "Could not stop container '%s': %s",
+                "Container '%s' is unhealthy (streak=%d). Last output: %s",
                 container_name,
-                stop_result.stderr.strip(),
+                failing_streak,
+                last_log.get("output", "N/A")
             )
             return False
+        elif status == "none":
+            logger.debug("Container '%s' has no health check; skipping wait.", container_name)
+            return True
 
-        if remove:
-            rm_result = subprocess.run(
-                [self.docker_binary, "rm", container_name],
-                capture_output=True,
-                text=True,
-            )
-            if rm_result.returncode != 0:
-                logger.warning(
-                    "Could not remove container '%s': %s",
-                    container_name,
-                    rm_result.stderr.strip(),
-                )
-        return True
-
-    def list_running_containers(self) -> list[str]:
-        """Return names of all currently running containers."""
-        result = subprocess.run(
-            [self.docker_binary, "ps", "--format", "{{.Names}}"],
-            capture_output=True,
-            text=True,
+        logger.debug(
+            "Container '%s' health status is '%s'. Retrying in %ds...",
+            container_name, status, interval
         )
-        if result.returncode != 0:
-            logger.error("Failed to list containers: %s", result.stderr.strip())
-            return []
-        names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        logger.debug("Running containers: %s", names)
-        return names
+        time.sleep(interval)
+        elapsed += interval
 
-    def container_exists(self, container_name: str) -> bool:
-        """Check whether a container (running or stopped) exists by name."""
-        result = subprocess.run(
-            [
-                self.docker_binary,
-                "ps",
-                "-a",
-                "--filter",
-                f"name=^{container_name}$",
-                "--format",
-                "{{.Names}}",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        return container_name in result.stdout.splitlines()
+    logger.warning("Timed out waiting for container '%s' to become healthy.", container_name)
+    return False
+
+
+def list_managed_containers(label: str = "entra-docker-sync=true") -> list:
+    """List all containers managed by this tool using a Docker label filter."""
+    result = run_docker_command([
+        "ps", "-a",
+        "--filter", f"label={label}",
+        "--format", "{{json .}}"
+    ])
+
+    if result.returncode != 0:
+        logger.error("Failed to list managed containers.")
+        return []
+
+    containers = []
+    for line in result.stdout.strip().splitlines():
+        try:
+            containers.append(json.loads(line))
+        except json.JSONDecodeError:
+            logger.warning("Could not parse container entry: %s", line)
+
+    logger.info("Found %d managed container(s).", len(containers))
+    return containers
