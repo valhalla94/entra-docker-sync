@@ -1,162 +1,152 @@
-#!/usr/bin/env python3
-"""Microsoft Graph API authentication module for entra-docker-sync.
+"""
+auth.py - Authentication module for Entra ID (Azure AD) via Microsoft Identity Platform.
 
-Handles OAuth2 client credentials flow to obtain access tokens
-for querying Entra ID (Azure AD) group memberships.
+This module handles OAuth 2.0 client credentials flow to obtain bearer tokens
+for use with the Microsoft Graph API. Tokens are cached in memory for their
+lifetime to avoid redundant requests.
+
+Typical usage:
+    from entra_docker_sync.auth import get_access_token
+
+    token = get_access_token()
+    headers = {"Authorization": f"Bearer {token}"}
+
+Environment / config requirements:
+    - AZURE_TENANT_ID   : The Directory (tenant) ID of the Entra ID tenant.
+    - AZURE_CLIENT_ID   : Application (client) ID of the registered app.
+    - AZURE_CLIENT_SECRET : Client secret generated for the registered app.
+
+The registered application must be granted the following Graph API
+application permissions (not delegated):
+    - GroupMember.Read.All   (read group memberships)
+    - User.Read.All          (read user profile details)
 """
 
-import os
 import time
 import logging
 import requests
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-GRAPH_API_BASE = "https://graph.microsoft.com/v1.0"
-TOKEN_URL_TEMPLATE = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
-GRAPH_SCOPE = "https://graph.microsoft.com/.default"
+# ---------------------------------------------------------------------------
+# Module-level token cache
+# ---------------------------------------------------------------------------
+# We cache the token dict returned by the token endpoint so we can reuse it
+# until it expires.  The cache is intentionally simple (no persistence) because
+# the script is designed to be run as a short-lived process or periodic cron job.
+_token_cache: dict = {
+    "access_token": None,
+    "expires_at": 0,  # Unix timestamp after which the token must be refreshed
+}
+
+# Refresh the token this many seconds before the reported expiry to give a
+# safety margin against clock skew or slow network round-trips.
+_TOKEN_REFRESH_BUFFER_SECONDS = 60
 
 
-class AuthenticationError(Exception):
-    """Raised when authentication with Microsoft identity platform fails."""
-    pass
+def get_access_token(config: dict) -> str:
+    """Return a valid bearer token for the Microsoft Graph API.
 
+    The function checks the in-memory cache first.  A new token is requested
+    from the Microsoft Identity Platform only when the cached token is absent
+    or within ``_TOKEN_REFRESH_BUFFER_SECONDS`` of expiry.
 
-class GraphAuthClient:
-    """Manages OAuth2 client credentials authentication for Microsoft Graph API.
+    Args:
+        config (dict): Parsed application configuration.  Must contain an
+            ``azure`` sub-dict with the following keys:
 
-    Attributes:
-        tenant_id (str): Azure AD tenant ID.
-        client_id (str): Application (client) ID registered in Entra ID.
-        client_secret (str): Client secret for the registered application.
-        _token (Optional[str]): Cached access token.
-        _token_expiry (float): Unix timestamp when the cached token expires.
+            .. code-block:: yaml
+
+                azure:
+                  tenant_id: "<GUID>"
+                  client_id: "<GUID>"
+                  client_secret: "<secret>"
+
+    Returns:
+        str: A valid OAuth 2.0 bearer access token.
+
+    Raises:
+        KeyError: If required keys are missing from *config*.
+        requests.HTTPError: If the token endpoint returns a non-2xx status.
+        RuntimeError: If the response body does not contain an ``access_token``.
     """
+    global _token_cache
 
-    def __init__(
-        self,
-        tenant_id: Optional[str] = None,
-        client_id: Optional[str] = None,
-        client_secret: Optional[str] = None,
-    ):
-        """Initialise GraphAuthClient.
+    now = time.time()
+    if _token_cache["access_token"] and now < _token_cache["expires_at"]:
+        logger.debug("Returning cached access token (expires in %.0f s).",
+                     _token_cache["expires_at"] - now)
+        return _token_cache["access_token"]
 
-        Credentials are resolved from arguments first, then from environment
-        variables ENTRA_TENANT_ID, ENTRA_CLIENT_ID, and ENTRA_CLIENT_SECRET.
+    logger.info("Requesting new access token from Microsoft Identity Platform.")
+    token_url, payload = _build_token_request(config)
+    response = requests.post(token_url, data=payload, timeout=30)
 
-        Args:
-            tenant_id: Azure AD tenant ID.
-            client_id: Application client ID.
-            client_secret: Application client secret.
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        logger.error("Token request failed: %s - %s", response.status_code, response.text)
+        raise
 
-        Raises:
-            AuthenticationError: If any required credential is missing.
-        """
-        self.tenant_id = tenant_id or os.environ.get("ENTRA_TENANT_ID", "")
-        self.client_id = client_id or os.environ.get("ENTRA_CLIENT_ID", "")
-        self.client_secret = client_secret or os.environ.get("ENTRA_CLIENT_SECRET", "")
+    token_data = response.json()
 
-        missing = []
-        if not self.tenant_id:
-            missing.append("ENTRA_TENANT_ID")
-        if not self.client_id:
-            missing.append("ENTRA_CLIENT_ID")
-        if not self.client_secret:
-            missing.append("ENTRA_CLIENT_SECRET")
+    if "access_token" not in token_data:
+        raise RuntimeError(
+            f"Token endpoint returned unexpected payload (missing 'access_token'): {token_data}"
+        )
 
-        if missing:
-            raise AuthenticationError(
-                f"Missing required credentials: {', '.join(missing)}. "
-                "Set them as environment variables or pass them explicitly."
-            )
+    expires_in = int(token_data.get("expires_in", 3600))
+    _token_cache["access_token"] = token_data["access_token"]
+    _token_cache["expires_at"] = now + expires_in - _TOKEN_REFRESH_BUFFER_SECONDS
 
-        self._token: Optional[str] = None
-        self._token_expiry: float = 0.0
+    logger.info(
+        "Access token acquired successfully (expires in %d s, cache valid for %d s).",
+        expires_in,
+        expires_in - _TOKEN_REFRESH_BUFFER_SECONDS,
+    )
+    return _token_cache["access_token"]
 
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
 
-    def get_access_token(self) -> str:
-        """Return a valid access token, refreshing it if necessary.
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
-        Returns:
-            A bearer token string suitable for use in Authorization headers.
+def _build_token_request(config: dict) -> tuple[str, dict]:
+    """Construct the token endpoint URL and POST payload.
 
-        Raises:
-            AuthenticationError: If the token request fails.
-        """
-        if self._is_token_valid():
-            logger.debug("Using cached access token.")
-            return self._token  # type: ignore[return-value]
+    Separated from :func:`get_access_token` to make unit-testing easier
+    without mocking the network.
 
-        logger.info("Requesting new access token from Microsoft identity platform.")
-        self._token, self._token_expiry = self._fetch_token()
-        return self._token
+    Args:
+        config (dict): Application configuration (see :func:`get_access_token`).
 
-    def get_headers(self) -> dict:
-        """Build HTTP headers containing a valid Bearer token.
+    Returns:
+        tuple[str, dict]: A 2-tuple of ``(token_url, form_payload)``.
+    """
+    azure_cfg = config["azure"]
+    tenant_id = azure_cfg["tenant_id"]
+    client_id = azure_cfg["client_id"]
+    client_secret = azure_cfg["client_secret"]
 
-        Returns:
-            Dictionary with Authorization and Content-Type headers.
-        """
-        return {
-            "Authorization": f"Bearer {self.get_access_token()}",
-            "Content-Type": "application/json",
-        }
+    token_url = (
+        f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+    )
+    payload = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        # Graph API audience - trailing slash is required by the endpoint.
+        "scope": "https://graph.microsoft.com/.default",
+    }
+    return token_url, payload
 
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
 
-    def _is_token_valid(self) -> bool:
-        """Check whether the cached token is present and not expired.
+def clear_token_cache() -> None:
+    """Invalidate the in-memory token cache.
 
-        A 60-second buffer is applied so tokens are refreshed before they
-        actually expire.
-
-        Returns:
-            True if the cached token can still be used, False otherwise.
-        """
-        buffer_seconds = 60
-        return bool(self._token) and time.time() < (self._token_expiry - buffer_seconds)
-
-    def _fetch_token(self) -> tuple[str, float]:
-        """Request a new client-credentials access token.
-
-        Returns:
-            A tuple of (access_token_string, expiry_unix_timestamp).
-
-        Raises:
-            AuthenticationError: If the HTTP request fails or returns an error.
-        """
-        token_url = TOKEN_URL_TEMPLATE.format(tenant_id=self.tenant_id)
-        payload = {
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-            "scope": GRAPH_SCOPE,
-            "grant_type": "client_credentials",
-        }
-
-        try:
-            response = requests.post(token_url, data=payload, timeout=30)
-        except requests.RequestException as exc:
-            raise AuthenticationError(f"Token request failed with network error: {exc}") from exc
-
-        if response.status_code != 200:
-            error_detail = response.json().get("error_description", response.text)
-            raise AuthenticationError(
-                f"Token request returned HTTP {response.status_code}: {error_detail}"
-            )
-
-        token_data = response.json()
-        access_token = token_data.get("access_token")
-        expires_in = int(token_data.get("expires_in", 3600))
-
-        if not access_token:
-            raise AuthenticationError("Response did not contain an access_token field.")
-
-        expiry = time.time() + expires_in
-        logger.info("Access token obtained; expires in %d seconds.", expires_in)
-        return access_token, expiry
+    Useful in tests or when you need to force re-authentication without
+    restarting the process.
+    """
+    global _token_cache
+    _token_cache = {"access_token": None, "expires_at": 0}
+    logger.debug("Token cache cleared.")
