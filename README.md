@@ -318,7 +318,7 @@ tail -f /var/log/entra-docker-sync/sync-$(date +%Y-%m-%d).log
 
 ## Security Considerations
 
-1. **Client secrets**: Never commit `settings.yaml` with real credentials. Use environment variables or a secrets manager (e.g., HashiCorp Vault, AWS Secrets Manager).
+1. **Client secrets**: Never commit `settings.yaml` with real credentials. Use environment variables or a secrets manager (e.g., HashiCorp Vault, Azure KeyVault).
 
 2. **Least privilege**: Grant the Entra application only `Group.Read.All` and `User.Read.All`. It does not need write access to Entra ID.
 
